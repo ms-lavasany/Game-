@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="fa">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Getaway 2 — Professional Offline</title>
+<style>
+  :root{--bg:#0b0f14;--ui:#ffffff;--accent:#ffcc33}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ui);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+  #gameCanvas{display:block;width:100vw;height:100vh;background:linear-gradient(#101820,#071018);touch-action:none;}
+  #hud{position:fixed;left:12px;top:12px;z-index:40;pointer-events:none}
+  .panel{background:rgba(0,0,0,0.35);padding:8px 10px;border-radius:10px;margin-bottom:8px;font-weight:700}
+  #controls{position:fixed;right:12px;bottom:12px;z-index:50;display:flex;gap:10px}
+  .btn{width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:center;font-weight:800;color:var(--ui);touch-action:none;user-select:none}
+  #centerMsg{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:60;pointer-events:none;font-size:20px;background:rgba(0,0,0,0.5);padding:12px;border-radius:12px;display:none}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" aria-label="Getaway 2 game"></canvas>
+<div id="hud" aria-hidden="true">
+  <div id="score" class="panel">امتیاز: 0</div>
+  <div id="info" class="panel">مرحله 1 — رسیدن به نقطه</div>
+  <div id="speed" class="panel">سرعت: 0</div>
+</div>
+<div id="controls" aria-hidden="true">
+  <div id="leftBtn" class="btn" aria-label="Left">◀</div>
+  <div id="rightBtn" class="btn" aria-label="Right">▶</div>
+  <div id="brakeBtn" class="btn" aria-label="Brake">⛔</div>
+  <div id="nitroBtn" class="btn" aria-label="Nitro">⚡</div>
+</div>
+<div id="centerMsg" role="status" aria-live="polite"></div>
+
+<script>
+/* Professional Getaway2-like single-file HTML
+   - Mobile-first, offline, robust fallback to 2D rendering
+   - Features: steering, police AI, traffic, missions/checkpoints, scoring, particles, simple audio
+   - Optimized for mid-range Android browsers (Chrome / Firefox)
+*/
+
+// ---- Setup ----
+const canvas = document.getElementById('gameCanvas');
+let gl = null, ctx2d = null;
+try { gl = canvas.getContext('webgl', {antialias:true, preserveDrawingBuffer:false}); } catch(e){ gl = null; }
+if(!gl) ctx2d = canvas.getContext('2d');
+
+function resizeCanvas(){
+  const w = innerWidth, h = innerHeight;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  canvas.width = Math.floor(w * dpr); canvas.height = Math.floor(h * dpr);
+  if(gl) gl.viewport(0,0,canvas.width,canvas.height);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const rand=(a,b)=>a+Math.random()*(b-a);
+
+// ---- World ----
+const world = {
+  player:{x:0,y:0.5,z:0,rot:0,speed:0.35,maxSpeed:0.9,alive:true},
+  camera:{x:0,y:4,z:12},
+  score:0, level:1, timeLeft:45, checkpointZ:-300,
+  enemies:[], traffic:[], particles:[], buildings:[], playing:true
+};
+
+function spawnEnemy(z){ world.enemies.push({x:rand(-3,3),y:0,z:z,rot:Math.PI,speed:0.28+Math.random()*0.16}); }
+function spawnTraffic(z){ world.traffic.push({x:rand(-3,3),y:0,z:z,speed:0.15+Math.random()*0.12}); }
+function spawnBuildings(){ for(let i=0;i<80;i++){ world.buildings.push({x:-6 - rand(0,6), y:rand(3,8)/2, z:-i*20 - rand(0,100), w:1+rand(0,2), h:3+rand(0,8)}); world.buildings.push({x:6+rand(0,6), y:rand(3,8)/2, z:-i*20 - rand(0,100), w:1+rand(0,2), h:3+rand(0,8)}); } }
+
+for(let i=0;i<10;i++) spawnEnemy(-50 - i*60);
+for(let i=0;i<12;i++) spawnTraffic(-30 - i*45);
+spawnBuildings();
+
+// ---- Input ----
+const input = {left:false,right:false,brake:false,nitro:false};
+function bind(id,key){
+  const el=document.getElementById(id);
+  el.addEventListener('pointerdown',e=>{ e.preventDefault(); input[key]=true; }, {passive:false});
+  el.addEventListener('pointerup',e=>{ e.preventDefault(); input[key]=false; }, {passive:false});
+  el.addEventListener('pointercancel',e=>{ input[key]=false; }, {passive:false});
+}
+bind('leftBtn','left'); bind('rightBtn','right'); bind('brakeBtn','brake'); bind('nitroBtn','nitro');
+window.addEventListener('keydown',e=>{ if(e.key==='ArrowLeft') input.left=true; if(e.key==='ArrowRight') input.right=true; if(e.key==='ArrowDown') input.brake=true; if(e.key===' ') { input.nitro=true; e.preventDefault(); } });
+window.addEventListener('keyup',e=>{ if(e.key==='ArrowLeft') input.left=false; if(e.key==='ArrowRight') input.right=false; if(e.key==='ArrowDown') input.brake=false; if(e.key===' ') input.nitro=false; });
+
+// ---- Audio ----
+let AC=null;
+function initAudio(){ if(AC) return; try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){AC=null;} }
+function beep(freq,dur,vol=0.05){ if(!AC) return; const o=AC.createOscillator(), g=AC.createGain(); o.type='sine'; o.frequency.value=freq; g.gain.value=vol; o.connect(AC.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime+dur); o.stop(AC.currentTime+dur+0.02); }
+function playCrash(){ beep(160,0.12,0.18); }
+window.addEventListener('pointerdown', ()=>initAudio(), {once:true});
+
+// ---- Particles ----
+function addParticles(x,y,z,n=10){
+  for(let i=0;i<n;i++) world.particles.push({x:x,y:y,z:z,vx:rand(-0.08,0.08),vy:rand(0.02,0.12),vz:rand(-0.08,0.08),life:0.7});
+}
+
+// ---- Projection ----
+function project(x,y,z){
+  const cam = world.camera;
+  const dx = x - cam.x, dy = y - cam.y, dz = z - cam.z;
+  const f = 380;
+  const sx = (dx / (dz + 60)) * f + canvas.width/2;
+  const sy = (dy / (dz + 60)) * f + canvas.height/2;
+  return {x:sx,y:sy,z:dz};
+}
+
+// ---- Reset & spawn ----
+function resetGame(){
+  world.player={x:0,y:0.5,z:0,rot:0,speed:0.35,maxSpeed:0.9,alive:true};
+  world.score=0; world.level=1; world.timeLeft=45; world.checkpointZ=-300;
+  world.enemies.length=0; world.traffic.length=0; world.particles.length=0;
+  for(let i=0;i<10;i++) spawnEnemy(-50 - i*60);
+  for(let i=0;i<12;i++) spawnTraffic(-30 - i*45);
+  document.getElementById('centerMsg').style.display='none'; world.playing=true;
+}
+resetGame();
+
+let last = performance.now();
+if(!ctx2d) ctx2d = canvas.getContext('2d');
+
+function drawScene(){
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const w = canvas.width/dpr, h = canvas.height/dpr;
+  ctx2d.save(); ctx2d.scale(dpr,dpr);
+  // background gradient
+  const g = ctx2d.createLinearGradient(0,0,0,h); g.addColorStop(0,'#122026'); g.addColorStop(1,'#071018'); ctx2d.fillStyle=g; ctx2d.fillRect(0,0,w,h);
+
+  // camera follow
+  world.camera.x = world.player.x; world.camera.z = world.player.z + 12; world.camera.y = 4;
+
+  // road strips
+  ctx2d.fillStyle = '#2b2b2b';
+  const roadW = Math.min(520, w*0.82);
+  for(let i=0;i<45;i++){
+    const z = Math.floor((world.player.z - i*20)/20)*20 - i*20;
+    const p1 = project(0,0,z), p2 = project(0,0,z+20);
+    const top = Math.min(p1.y,p2.y), bottom = Math.max(p1.y,p2.y);
+    ctx2d.fillRect((w-roadW)/2, top, roadW, bottom-top+2);
+  }
+
+  // buildings
+  world.buildings.forEach(b=>{
+    if(b.z > world.player.z + 100) return; if(b.z < world.player.z - 700) return;
+    const pr = project(b.x, b.y, b.z);
+    const scale = clamp(900/(pr.z+100), 0.25, 1.6);
+    const bw = b.w*20*scale, bh = b.h*20*scale;
+    ctx2d.fillStyle = '#444'; ctx2d.fillRect(pr.x - bw/2, pr.y - bh, bw, bh);
+  });
+
+  // checkpoint gate
+  const gateZ = world.checkpointZ;
+  const pg = project(0,0,gateZ);
+  ctx2d.fillStyle = '#ffcc33'; ctx2d.fillRect(pg.x - 6, pg.y - 160, 12, 160);
+
+  // draw cars
+  function drawCar(o,color){
+    const p = project(o.x, 0.5, o.z);
+    if(p.z > 700 || p.z < -60) return;
+    const s = clamp(160/(p.z+100),0.6,2.4);
+    const w2 = 22*s, h2 = 14*s;
+    ctx2d.fillStyle = color; ctx2d.fillRect(p.x - w2/2, p.y - h2/2, w2, h2);
+    // wheels as small rectangles
+    ctx2d.fillStyle = '#111'; ctx2d.fillRect(p.x - w2/2 + 2, p.y + h2/4, w2*0.2, h2*0.18);
+    ctx2d.fillRect(p.x + w2/2 - 2 - w2*0.2, p.y + h2/4, w2*0.2, h2*0.18);
+  }
+  world.traffic.forEach(t=> drawCar(t,'#cfcfcf'));
+  world.enemies.forEach(e=> drawCar(e,'#ff6666'));
+  drawCar(world.player,'#3da4ff');
+
+  // particles
+  world.particles.forEach(pa=>{
+    const pr = project(pa.x, pa.y, pa.z);
+    if(pr.z < -50 || pr.z > 900) return;
+    ctx2d.fillStyle = 'rgba(255,170,70,0.95)'; ctx2d.fillRect(pr.x, pr.y, 4,4);
+  });
+
+  ctx2d.restore();
+}
+
+// ---- Update ----
+function update(dt){
+  if(!world.playing) return;
+  const p = world.player;
+  const steer = (input.left?-1:0) + (input.right?1:0);
+  p.rot += steer * 1.8 * dt;
+  let base = p.speed + (input.nitro?0.5:0) - (input.brake?0.28:0);
+  base = clamp(base, 0.05, p.maxSpeed + (input.nitro?0.35:0));
+  p.x -= Math.sin(p.rot) * base;
+  p.z -= Math.cos(p.rot) * base;
+  world.camera.x = p.x; world.camera.z = p.z + 12; world.camera.y = 4;
+
+  // enemies AI pursuit
+  world.enemies.forEach(e=>{
+    const dx = p.x - e.x, dz = p.z - e.z;
+    const ang = Math.atan2(-dx,-dz);
+    e.rot += (ang - (e.rot||0)) * 0.05;
+    const sp = e.speed + 0.02*world.level;
+    e.x -= Math.sin(e.rot) * sp; e.z -= Math.cos(e.rot) * sp;
+    if(e.z > p.z + 28){ e.z = p.z - 220 - Math.random()*220; e.x = rand(-3,3); }
+  });
+
+  // traffic movement
+  world.traffic.forEach(t=>{
+    t.z += t.speed;
+    if(t.z > p.z + 20){ t.z = p.z - 220 - Math.random()*140; t.x = rand(-3,3); }
+  });
+
+  // particles physics
+  for(let i=world.particles.length-1;i>=0;i--){
+    const pa = world.particles[i]; pa.x += pa.vx; pa.y += pa.vy; pa.z += pa.vz; pa.life -= dt;
+    if(pa.life<=0) world.particles.splice(i,1);
+  }
+
+  // checkpoint
+  world.timeLeft -= dt;
+  if(p.z < world.checkpointZ){
+    world.level++; world.score += 750; world.timeLeft = Math.max(10, 30 - world.level*2);
+    world.checkpointZ -= 350;
+    const cm = document.getElementById('centerMsg'); cm.textContent = 'مرحله '+world.level+' شروع شد'; cm.style.display='block'; setTimeout(()=>{ cm.style.display='none'; },1200);
+  }
+  if(world.timeLeft <= 0) gameOver('وقت تمام شد');
+
+  // collisions (AABB)
+  function hit(a,b){ return Math.abs(a.x-b.x) < 1.15 && Math.abs(a.z-b.z) < 1.9; }
+  let collided=false;
+  world.enemies.forEach(e=>{ if(hit(p,e)) collided=true; });
+  world.traffic.forEach(t=>{ if(hit(p,t)) collided=true; });
+  if(collided){ addParticles(p.x,0.5,p.z,20); playCrash(); gameOver('تصادف'); }
+
+  // HUD update
+  world.score += dt*14;
+  document.getElementById('score').textContent = 'امتیاز: ' + Math.floor(world.score);
+  document.getElementById('info').textContent = 'مرحله '+world.level+' — زمان: '+Math.ceil(world.timeLeft)+'s';
+  document.getElementById('speed').textContent = 'سرعت: ' + Math.round(base*220);
+}
+
+// ---- Main loop ----
+let then = performance.now();
+function mainLoop(now){
+  const dt = Math.min(0.04, (now - then)/1000 || 0.016);
+  then = now;
+  update(dt);
+  drawScene();
+  requestAnimationFrame(mainLoop);
+}
+requestAnimationFrame(mainLoop);
+
+// ---- Utilities ----
+function gameOver(msg){
+  world.playing=false; world.player.alive=false;
+  const cm = document.getElementById('centerMsg'); cm.textContent = 'Game Over — ' + msg + ' — لمس کن برای شروع مجدد'; cm.style.display='block'; cm.style.pointerEvents='auto';
+  cm.addEventListener('pointerdown', ()=>{ resetGame(); }, {once:true});
+}
+function resetGame(){
+  resetGameInternal();
+  document.getElementById('centerMsg').style.display='none';
+}
+function resetGameInternal(){
+  world.player={x:0,y:0.5,z:0,rot:0,speed:0.35,maxSpeed:0.9,alive:true};
+  world.score=0; world.level=1; world.timeLeft=45; world.checkpointZ=-300;
+  world.enemies.length=0; world.traffic.length=0; world.particles.length=0; world.buildings.length=0;
+  for(let i=0;i<10;i++) spawnEnemy(-50 - i*60);
+  for(let i=0;i<12;i++) spawnTraffic(-30 - i*45);
+  spawnBuildings();
+  world.playing=true;
+}
+</script>
+</body>
+</html>
