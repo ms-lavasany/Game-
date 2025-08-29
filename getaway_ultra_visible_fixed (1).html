@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="fa">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Getaway‑Ultra‑Visible — 3D Demo (Single File)</title>
+<style>
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#1e3a56,#071421);font-family:system-ui,Segoe UI,Roboto; color:#eaf6ff}
+  #wrap{position:relative;height:100vh;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh}
+  #hud{position:absolute;left:12px;top:12px;z-index:50}
+  .panel{background:rgba(0,0,0,0.45);padding:8px 12px;border-radius:10px;margin-bottom:8px;font-weight:700}
+  #controls{position:absolute;right:12px;bottom:12px;z-index:50;display:flex;flex-direction:column;gap:10px}
+  .btn{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.06);font-weight:800;touch-action:none}
+  #lr{position:absolute;left:12px;bottom:12px;display:flex;gap:10px;z-index:50}
+  .hint{position:absolute;left:50%;bottom:86px;transform:translateX(-50%);font-size:12px;opacity:.85}
+  #msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.7);padding:12px 16px;border-radius:10px;display:none;z-index:80}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gl" aria-label="Getaway 3D visible demo"></canvas>
+  <div id="hud">
+    <div id="score" class="panel">امتیاز: 0</div>
+    <div id="info" class="panel">مرحله 1 — زمان: 60</div>
+    <div id="speed" class="panel">سرعت: 0</div>
+  </div>
+  <div id="lr"><div id="left" class="btn">◀</div><div id="right" class="btn">▶</div></div>
+  <div id="controls"><div id="brake" class="btn">⛔</div><div id="nitro" class="btn">⚡</div></div>
+  <div class="hint">اگر تصویر نمی‌بینی: فایل را با مرورگر (Chrome/Firefox) باز کن — نه پیش‌نمایش فایل‌منیجر.</div>
+  <div id="msg"></div>
+</div>
+
+<script>
+/*
+ Robust minimal WebGL 3D scene that is very likely to show something on any WebGL-capable browser.
+ - Draws a sky (CSS), ground plane, visible player car (blue box) and a row of buildings
+ - Simple directional lighting, perspective camera, and basic controls
+ - Focus on guaranteed visibility and no console errors
+*/
+
+const canvas = document.getElementById('gl');
+let gl = null;
+try { gl = canvas.getContext('webgl', {antialias:true}); } catch(e){ gl = null; }
+if(!gl){
+  document.getElementById('msg').style.display='block';
+  document.getElementById('msg').textContent = 'مرورگرت WebGL را پشتیبانی نمی‌کند یا WebGL فعال نیست — لطفاً Chrome/Firefox را امتحان کنید.';
+} else {
+  // Resize logic (cap DPR for mobile to avoid OOM)
+  function resize(){ 
+    const DPR = Math.max(1, Math.min(window.devicePixelRatio || 1, 1.5));
+    canvas.width = Math.floor(window.innerWidth * DPR);
+    canvas.height = Math.floor(window.innerHeight * DPR);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    gl.viewport(0,0,canvas.width,canvas.height);
+  }
+  window.addEventListener('resize', resize, {passive:true}); resize();
+
+  // Basic shader - position + normal + color, simple lambert+spec
+  const vs = `attribute vec3 aPos; attribute vec3 aNor; attribute vec3 aCol; uniform mat4 uMVP; uniform mat4 uModel; varying vec3 vN; varying vec3 vColor; varying vec3 vP; void main(){ vN = normalize(mat3(uModel)*aNor); vColor = aCol; vec4 wp = uModel * vec4(aPos,1.0); vP = wp.xyz; gl_Position = uMVP * vec4(aPos,1.0); }`;
+  const fs = `precision mediump float; varying vec3 vN; varying vec3 vColor; varying vec3 vP; uniform vec3 uLight; uniform vec3 uEye; void main(){ vec3 N = normalize(vN); vec3 L = normalize(uLight); float diff = max(dot(N,L),0.0); vec3 V = normalize(uEye - vP); vec3 H = normalize(L+V); float spec = pow(max(dot(N,H),0.0), 24.0) * 0.35; vec3 col = vColor * (0.18 + 0.82*diff) + spec * vec3(1.0); gl_FragColor = vec4(col,1.0); }`;
+
+  function compile(t, src){ const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){ console.warn('Shader error:', gl.getShaderInfoLog(s)); } return s; }
+  const prog = gl.createProgram(); gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) console.warn('Program link:', gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE);
+
+  const ATTR = { pos: gl.getAttribLocation(prog,'aPos'), nor: gl.getAttribLocation(prog,'aNor'), col: gl.getAttribLocation(prog,'aCol') };
+  const UNI = { mvp: gl.getUniformLocation(prog,'uMVP'), model: gl.getUniformLocation(prog,'uModel'), light: gl.getUniformLocation(prog,'uLight'), eye: gl.getUniformLocation(prog,'uEye') };
+  gl.uniform3f(UNI.light, -0.5, 1.0, 0.3);
+
+  // Build a cube (positions, normals, colors)
+  function buildCube(w,h,d, color){
+    const hw = w/2, hh = h/2, hd = d/2;
+    const v = [];
+    function V(px,py,pz,nx,ny,nz){
+      v.push(px,py,pz, nx,ny,nz, color[0],color[1],color[2]);
+    }
+    // faces
+    // front
+    V(-hw,-hh, hd, 0,0,1); V(hw,-hh, hd,0,0,1); V(hw,hh,hd,0,0,1);
+    V(-hw,-hh, hd, 0,0,1); V(hw,hh,hd,0,0,1); V(-hw,hh,hd,0,0,1);
+    // back
+    V(-hw,-hh,-hd,0,0,-1); V(-hw,hh,-hd,0,0,-1); V(hw,hh,-hd,0,0,-1);
+    V(-hw,-hh,-hd,0,0,-1); V(hw,hh,-hd,0,0,-1); V(hw,-hh,-hd,0,0,-1);
+    // right
+    V(hw,-hh,-hd,1,0,0); V(hw,hh,-hd,1,0,0); V(hw,hh,hd,1,0,0);
+    V(hw,-hh,-hd,1,0,0); V(hw,hh,hd,1,0,0); V(hw,-hh,hd,1,0,0);
+    // left
+    V(-hw,-hh,-hd,-1,0,0); V(-hw,-hh,hd,-1,0,0); V(-hw,hh,hd,-1,0,0);
+    V(-hw,-hh,-hd,-1,0,0); V(-hw,hh,hd,-1,0,0); V(-hw,hh,-hd,-1,0,0);
+    // top
+    V(-hw,hh,-hd,0,1,0); V(-hw,hh,hd,0,1,0); V(hw,hh,hd,0,1,0);
+    V(-hw,hh,-hd,0,1,0); V(hw,hh,hd,0,1,0); V(hw,hh,-hd,0,1,0);
+    // bottom
+    V(-hw,-hh,-hd,0,-1,0); V(hw,-hh,-hd,0,-1,0); V(hw,-hh,hd,0,-1,0);
+    V(-hw,-hh,-hd,0,-1,0); V(hw,-hh,hd,0,-1,0); V(-hw,-hh,hd,0,-1,0);
+    return new Float32Array(v);
+  }
+
+  // Ground plane (two large triangles) with normals up, color
+  function buildGround(size, color){
+    const s = size;
+    const verts = new Float32Array([
+      -s,0,-s,  0,1,0,  color[0],color[1],color[2],
+       s,0,-s,  0,1,0,  color[0],color[1],color[2],
+       s,0, s,  0,1,0,  color[0],color[1],color[2],
+      -s,0,-s,  0,1,0,  color[0],color[1],color[2],
+       s,0, s,  0,1,0,  color[0],color[1],color[2],
+      -s,0, s,  0,1,0,  color[0],color[1],color[2]
+    ]);
+    return verts;
+  }
+
+  // Buffers
+  const carMesh = buildCube(1.2,0.5,1.8, [0.12,0.6,0.95]);
+  const carVBO = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, carVBO); gl.bufferData(gl.ARRAY_BUFFER, carMesh, gl.STATIC_DRAW);
+
+  const groundMesh = buildGround(300, [0.12,0.12,0.13]);
+  const groundVBO = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, groundVBO); gl.bufferData(gl.ARRAY_BUFFER, groundMesh, gl.STATIC_DRAW);
+
+  // some buildings close to camera for visibility
+  const buildings = [];
+  for(let i=0;i<8;i++){
+    const side = i%2?1:-1;
+    const x = side * (3 + (i%3)*1.2);
+    const z = -8 - i*6;
+    const h = 2.5 + (i%4)*1.6;
+    buildings.push({pos:[x,h/2,z], scl:[1.8, h, 1.6], color: side>0?[0.18,0.22,0.28]:[0.22,0.28,0.32]});
+  }
+  const buildingMesh = buildCube(1,1,1,[0.8,0.8,0.8]);
+  const buildingVBO = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buildingVBO); gl.bufferData(gl.ARRAY_BUFFER, buildingMesh, gl.STATIC_DRAW);
+
+  // attribute binder function
+  function bindBufferFor(meshVBO){
+    gl.bindBuffer(gl.ARRAY_BUFFER, meshVBO);
+    gl.enableVertexAttribArray(ATTR.pos); gl.vertexAttribPointer(ATTR.pos, 3, gl.FLOAT, false, 9*4, 0);
+    gl.enableVertexAttribArray(ATTR.nor); gl.vertexAttribPointer(ATTR.nor, 3, gl.FLOAT, false, 9*4, 3*4);
+    gl.enableVertexAttribArray(ATTR.col); gl.vertexAttribPointer(ATTR.col, 3, gl.FLOAT, false, 9*4, 6*4);
+  }
+
+  // Simple matrix helpers
+  const Mat = {
+    ident(){ return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; },
+    mul(a,b){ const r=new Array(16).fill(0); for(let i=0;i<4;i++) for(let j=0;j<4;j++) for(let k=0;k<4;k++) r[i*4+j]+=a[i*4+k]*b[k*4+j]; return r; },
+    translate(m,x,y,z){ const t=[1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1]; return Mat.mul(m,t); },
+    scale(m,x,y,z){ const s=[x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1]; return Mat.mul(m,s); },
+    rotateY(m,a){ const c=Math.cos(a), s=Math.sin(a); const r=[c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]; return Mat.mul(m,r); },
+    perspective(fov, aspect, near, far){ const f=1/Math.tan(fov/2); const nf=1/(near-far); return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,(2*far*near)*nf,0]; },
+    lookAt(eye, center, up){
+      const zx=eye[0]-center[0], zy=eye[1]-center[1], zz=eye[2]-center[2];
+      let zl=Math.hypot(zx,zy,zz); if(zl===0) zl=1;
+      const z=[zx/zl, zy/zl, zz/zl];
+      const xx = up[1]*z[2] - up[2]*z[1], xy = up[2]*z[0] - up[0]*z[2], xz = up[0]*z[1] - up[1]*z[0];
+      let xl = Math.hypot(xx,xy,xz); if(xl===0) xl=1;
+      const x=[xx/xl, xy/xl, xz/xl];
+      const y=[ z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0] ];
+      return [ x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]), -(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]), -(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]), 1 ];
+    }
+  };
+
+  // Scene variables
+  const Player = { pos: [0,0.6,0], rot: 0, vel: 0.45, nitro: 1, hp:1};
+  let last = performance.now();
+
+  // Input
+  const input = {L:false,R:false,br:false,ni:false};
+  function bindBtn(id,key){ const el=document.getElementById(id); el.addEventListener('pointerdown', e=>{ e.preventDefault(); input[key]=true; }, {passive:false}); el.addEventListener('pointerup', e=>{ input[key]=false; }, {passive:false}); el.addEventListener('pointercancel', ()=>input[key]=false); }
+  bindBtn('left','L'); bindBtn('right','R'); bindBtn('brake','br'); bindBtn('nitro','ni');
+  window.addEventListener('keydown', e=>{ if(e.key==='ArrowLeft') input.L=true; if(e.key==='ArrowRight') input.R=true; if(e.key==='ArrowDown') input.br=true; if(e.key===' ') { input.ni=true; e.preventDefault(); } });
+  window.addEventListener('keyup', e=>{ if(e.key==='ArrowLeft') input.L=false; if(e.key==='ArrowRight') input.R=false; if(e.key==='ArrowDown') input.br=false; if(e.key===' ') input.ni=false; });
+
+  // Start rendering automatically
+  function render(now){
+    try{
+      const dt = Math.min(0.05, (now - last)/1000);
+      last = now;
+      // update player movement simple
+      let steer = 0;
+      if(input.L) steer += 1;
+      if(input.R) steer -= 1;
+      Player.rot += 1.6 * steer * dt;
+      let sp = Player.vel + (input.ni?0.9:0) - (input.br?0.6:0);
+      sp = Math.max(0.06, Math.min(sp, 2.4));
+      Player.pos[0] -= Math.sin(Player.rot) * sp * dt * 4.5;
+      Player.pos[2] -= Math.cos(Player.rot) * sp * dt * 4.5;
+
+      // camera
+      const camPos = [ Player.pos[0] + Math.sin(Player.rot)*6, 3.6, Player.pos[2] + Math.cos(Player.rot)*8 ];
+      const camTarget = [ Player.pos[0], 0.9, Player.pos[2] ];
+      const proj = Mat.perspective(Math.PI/3, canvas.width/canvas.height, 0.1, 3000);
+      const view = Mat.lookAt(camPos, camTarget, [0,1,0]);
+      const PV = Mat.mul(proj, view);
+
+      // clear
+      gl.clearColor(0.02,0.04,0.08,1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      // ground (big)
+      gl.uniform3f(UNI.light, -0.5, 1.0, 0.3);
+      gl.uniform3f(UNI.eye, camPos[0], camPos[1], camPos[2]);
+      gl.useProgram(prog);
+      // draw ground (bind and draw)
+      gl.bindBuffer(gl.ARRAY_BUFFER, groundVBO);
+      gl.vertexAttribPointer(ATTR.pos,3,gl.FLOAT,false,9*4,0); gl.enableVertexAttribArray(ATTR.pos);
+      gl.vertexAttribPointer(ATTR.nor,3,gl.FLOAT,false,9*4,3*4); gl.enableVertexAttribArray(ATTR.nor);
+      gl.vertexAttribPointer(ATTR.col,3,gl.FLOAT,false,9*4,6*4); gl.enableVertexAttribArray(ATTR.col);
+      // world transform identity
+      gl.uniformMatrix4fv(UNI.model, false, new Float32Array(Mat.ident()));
+      gl.uniformMatrix4fv(UNI.mvp, false, new Float32Array(PV));
+      gl.drawArrays(gl.TRIANGLES, 0, groundMesh.length/9);
+
+      // buildings
+      gl.bindBuffer(gl.ARRAY_BUFFER, buildingVBO);
+      gl.vertexAttribPointer(ATTR.pos,3,gl.FLOAT,false,9*4,0);
+      gl.vertexAttribPointer(ATTR.nor,3,gl.FLOAT,false,9*4,3*4);
+      gl.vertexAttribPointer(ATTR.col,3,gl.FLOAT,false,9*4,6*4);
+
+      for(const b of buildings){
+        const m0 = Mat.translate(Mat.ident(), b.pos[0], b.pos[1], b.pos[2]);
+        const m1 = Mat.scale(m0, b.scl[0], b.scl[1], b.scl[2]);
+        gl.uniformMatrix4fv(UNI.model, false, new Float32Array(m1));
+        const mvp = Mat.mul(PV, m1);
+        gl.uniformMatrix4fv(UNI.mvp, false, new Float32Array(mvp));
+        // tint color by writing a small dynamic color into shader via VBO? Simpler: use prebuilt color in buffer - but building has neutral buffer so colors come from buffer. To ensure correct visible color, we'll set color by updating buffer (cheap for few buildings)
+        // For simplicity we just draw cube (it uses default neutral color baked into buffer)
+        gl.drawArrays(gl.TRIANGLES, 0, buildingMesh.length/9);
+      }
+
+      // car
+      gl.bindBuffer(gl.ARRAY_BUFFER, carVBO);
+      gl.vertexAttribPointer(ATTR.pos,3,gl.FLOAT,false,9*4,0);
+      gl.vertexAttribPointer(ATTR.nor,3,gl.FLOAT,false,9*4,3*4);
+      gl.vertexAttribPointer(ATTR.col,3,gl.FLOAT,false,9*4,6*4);
+      const cm = Mat.translate(Mat.ident(), Player.pos[0], Player.pos[1], Player.pos[2]);
+      const cmr = Mat.rotateY(cm, Player.rot);
+      const cmS = Mat.scale(cmr, 1.0, 1.0, 1.0);
+      gl.uniformMatrix4fv(UNI.model, false, new Float32Array(cmS));
+      const carMVP = Mat.mul(PV, cmS);
+      gl.uniformMatrix4fv(UNI.mvp, false, new Float32Array(carMVP));
+      gl.drawArrays(gl.TRIANGLES, 0, carMesh.length/9);
+
+      // small particles (none by default)
+
+      requestAnimationFrame(render);
+    }catch(e){
+      // show error instead of crashing
+      const msg = document.getElementById('msg');
+      msg.style.display = 'block';
+      msg.textContent = 'خطا در اجرا: ' + (e && e.message ? e.message : String(e));
+      console.warn(e);
+    }
+  } // render end
+
+  // start render loop now so scene is visible without user input
+  requestAnimationFrame(render);
+} // end gl available
+</script>
+</body>
+</html>
